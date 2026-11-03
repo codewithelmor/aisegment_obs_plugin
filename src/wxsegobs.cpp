@@ -44,14 +44,18 @@ static void resizeAndCrop(const cv::Mat& input, int width, int height, cv::Mat& 
 			dh = (int)(scale * (float)input.rows);
 		}
 
-		cv::resize(input, output, cv::Size(dw, dh));
+		cv::Mat resized;
+		cv::resize(input, resized, cv::Size(dw, dh));
 		if (width < dw) {
 			int x = (dw - width) / 2;
-			output = input(cv::Range::all(), cv::Range(x, x + width));
+			output = resized(cv::Range::all(), cv::Range(x, x + width)).clone();
 		}
 		else if (height < dh) {
 			int y = (dh - height) / 2;
-			output = input(cv::Range(y, y + height), cv::Range::all());
+			output = resized(cv::Range(y, y + height), cv::Range::all()).clone();
+		}
+		else {
+			output = resized;
 		}
 	}
 	if (!output.isContinuous()) {
@@ -64,6 +68,9 @@ typedef struct wx_seg_filter
 	// Use the media-io converter to both scale and convert the colorspace
 	video_scaler_t* scalerToBGR;
 	video_scaler_t* scalerFromBGR;
+	uint32_t lastW;
+	uint32_t lastH;
+	enum video_format lastFmt;
 	bool disseg = false;
 	bool blurbg = true;
 	bool usesetbg = false;
@@ -446,6 +453,20 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 		return frame;
 
 	// Convert to BGR
+	if (!handle)
+		return frame;
+
+	// Frame size/format may differ from the first frame (e.g. after restart): rebuild state.
+	if (wsf->lastW != frame->width || wsf->lastH != frame->height || wsf->lastFmt != frame->format) {
+		destroyScalers(wsf);
+		alpha.release();
+		blend.release();
+		setbginit = false;
+		wsf->lastW = frame->width;
+		wsf->lastH = frame->height;
+		wsf->lastFmt = frame->format;
+	}
+
 	cv::Mat imageBGR = convertFrameToBGR(frame, wsf);
 
 	wx_image_t img_frame = { imageBGR.cols, imageBGR.rows,WX_IMG_BGR24,(int)imageBGR.step[0],imageBGR.data };
@@ -522,21 +543,22 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 
 			//FILE* pFile = _wfopen(path_ws.c_str(), L"rb");
 			//setlocale(LC_ALL, "Chinese-simplified");//设置中文环境
-			FILE* pFile = os_fopen(wsf->bgpath,"rb"); //fopen
-			fseek(pFile, 0, SEEK_END);
-			long lSize = ftell(pFile);
-			rewind(pFile);
-			char* pData = new char[lSize];
-			fread(pData, sizeof(char), lSize, pFile);
-			fclose(pFile);
+			setbgpic.release();
+			FILE* pFile = (wsf->bgpath && *wsf->bgpath) ? os_fopen(wsf->bgpath, "rb") : nullptr;
+			if (pFile) {
+				fseek(pFile, 0, SEEK_END);
+				long lSize = ftell(pFile);
+				rewind(pFile);
+				if (lSize > 0) {
+					std::vector<char> cvdata((size_t)lSize);
+					size_t rd = fread(cvdata.data(), sizeof(char), (size_t)lSize, pFile);
+					cvdata.resize(rd);
+					if (rd > 0)
+						setbgpic = cv::imdecode(cvdata, cv::IMREAD_COLOR);
+				}
+				fclose(pFile);
+			}
 
-			std::vector<char> cvdata(pData, pData + lSize);
-			//std::vector<uchar> cvdata; 
-			//for (int i = 0; i < lSize; ++i) 
-			//	cvdata.push_back(pData[i]);
-
-			setbgpic = cv::imdecode(cvdata, cv::IMREAD_COLOR);
-			
 			//setbgpic = cv::imread(wsf->bgpath);
 
 			if (setbgpic.empty())
@@ -564,20 +586,18 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 		if(wsf->blurbg)
 			img_bg = { bg.cols,bg.rows, WX_IMG_BGR24,(int)bg.step[0],bg.data };
 		else if(wsf->usesetbg)
-			img_bg = { setbgpic.cols,bg.rows, WX_IMG_BGR24,(int)setbgpic.step[0],setbgpic.data };
+			img_bg = { setbgpic.cols,setbgpic.rows, WX_IMG_BGR24,(int)setbgpic.step[0],setbgpic.data };
 		else
-			img_bg = { setbgcolor.cols,bg.rows, WX_IMG_BGR24,(int)setbgcolor.step[0],setbgcolor.data };
+			img_bg = { setbgcolor.cols,setbgcolor.rows, WX_IMG_BGR24,(int)setbgcolor.step[0],setbgcolor.data };
 
 
 		// 图像融合
 		res = wx_vseg_blend(&img_frame, &img_bg, &img_alpha, &img_blend);
 		if (res != 0) {
 			printf("failed in wx_vseg_blend, res: %d\n", res);
+			// Never output an uninitialised (black) buffer; pass the original frame through.
+			return frame;
 		}
-
-		//cv::imshow("blend", blend);
-		//Put masked image back on frame,
-
 
 		convertBGRToFrame(blend, frame, wsf);
 	}
