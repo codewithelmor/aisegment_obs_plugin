@@ -7,6 +7,16 @@
 #include <memory>
 #include <exception>
 #include <fstream>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <algorithm>
+#include <cctype>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "plugin-macros.generated.h"
 #include "wx_vseg.h"
@@ -63,6 +73,135 @@ static void resizeAndCrop(const cv::Mat& input, int width, int height, cv::Mat& 
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Video background: decodes a looping video on a worker thread and keeps the
+// most recent frame (already resized/cropped to the camera size) ready for
+// the render callback.
+// ---------------------------------------------------------------------------
+class VideoBackground {
+public:
+	~VideoBackground() { stop(); }
+
+	void start(const std::string& utf8Path, int w, int h)
+	{
+		stop();
+		path_ = toOpenCvPath(utf8Path);
+		w_ = w;
+		h_ = h;
+		quit_ = false;
+		thread_ = std::thread([this] { run(); });
+	}
+
+	void stop()
+	{
+		quit_ = true;
+		if (thread_.joinable())
+			thread_.join();
+		std::lock_guard<std::mutex> lk(mtx_);
+		latest_.release();
+	}
+
+	bool active() const { return thread_.joinable(); }
+
+	// Copies the newest frame into dst. Returns false if none is available yet.
+	bool getFrame(cv::Mat& dst)
+	{
+		std::lock_guard<std::mutex> lk(mtx_);
+		if (latest_.empty())
+			return false;
+		latest_.copyTo(dst);
+		return true;
+	}
+
+private:
+	static std::string toOpenCvPath(const std::string& utf8)
+	{
+#ifdef _WIN32
+		// OpenCV takes a narrow string in the ANSI code page; use the ASCII
+		// 8.3 short path so non-ASCII file names still open.
+		wchar_t* wide = nullptr;
+		if (os_utf8_to_wcs_ptr(utf8.c_str(), 0, &wide) > 0 && wide) {
+			wchar_t shortPath[MAX_PATH] = {};
+			DWORD n = GetShortPathNameW(wide, shortPath, MAX_PATH);
+			std::string out = utf8;
+			if (n > 0 && n < MAX_PATH) {
+				char narrow[MAX_PATH] = {};
+				if (WideCharToMultiByte(CP_ACP, 0, shortPath, -1, narrow, MAX_PATH, nullptr, nullptr) > 0)
+					out = narrow;
+			}
+			bfree(wide);
+			return out;
+		}
+#endif
+		return utf8;
+	}
+
+	void run()
+	{
+		using clock = std::chrono::steady_clock;
+		cv::VideoCapture cap;
+		cv::Mat raw, fitted;
+		auto next = clock::now();
+		int failures = 0;
+
+		while (!quit_) {
+			if (!cap.isOpened()) {
+				if (!cap.open(path_) || !cap.isOpened()) {
+					// Cannot open: retry slowly instead of spinning.
+					std::this_thread::sleep_for(std::chrono::milliseconds(500));
+					continue;
+				}
+			}
+			double fps = cap.get(cv::CAP_PROP_FPS);
+			if (!(fps >= 1.0 && fps <= 120.0))
+				fps = 30.0;
+			const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / fps));
+
+			if (!cap.read(raw) || raw.empty()) {
+				// End of file: loop. If rewinding fails repeatedly, reopen.
+				if (++failures > 2) {
+					cap.release();
+					failures = 0;
+				} else {
+					cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+				}
+				continue;
+			}
+			failures = 0;
+
+			cv::Mat bgr;
+			if (raw.channels() == 4)
+				cv::cvtColor(raw, bgr, cv::COLOR_BGRA2BGR);
+			else if (raw.channels() == 1)
+				cv::cvtColor(raw, bgr, cv::COLOR_GRAY2BGR);
+			else
+				bgr = raw;
+			resizeAndCrop(bgr, w_, h_, fitted);
+			{
+				std::lock_guard<std::mutex> lk(mtx_);
+				fitted.copyTo(latest_);
+			}
+
+			next += period;
+			auto now = clock::now();
+			if (next < now)
+				next = now; // decoding is slower than real time; don't try to catch up
+			else
+				std::this_thread::sleep_until(next);
+		}
+	}
+
+	std::thread thread_;
+	std::mutex mtx_;
+	std::atomic<bool> quit_{false};
+	std::string path_;
+	int w_ = 0, h_ = 0;
+	cv::Mat latest_;
+};
+
+static VideoBackground videoBg;
+static bool bgIsVideo = false;
+
 typedef struct wx_seg_filter
 {
 	// Use the media-io converter to both scale and convert the colorspace
@@ -75,6 +214,8 @@ typedef struct wx_seg_filter
 	bool blurbg = true;
 	bool usesetbg = false;
 	char* bgpath;
+	bool usevideobg = false;
+	char* videopath;
 	bool usesetcolor = false;
 	cv::Scalar backgroundColor{ 0, 0, 0 };
 
@@ -94,7 +235,7 @@ static const char *filter_getname(void *unused)
 	return "AI_remove_bg";
 }
 
-static bool chblur=true, chbg = false, chcolor = false;
+static bool chblur=true, chbg = false, chcolor = false, chvideo = false;
 
 static bool tracking_props_modified(obs_properties_t* props, obs_property_t* property, obs_data_t* settings)
 {
@@ -118,7 +259,9 @@ static bool tracking_props_modified(obs_properties_t* props, obs_property_t* pro
 		chblur   = obs_data_get_bool(settings, "blurbgbool");
 		chbg = obs_data_get_bool(settings, "setbg");
 		chcolor = obs_data_get_bool(settings, "setcolor");
+		chvideo = obs_data_get_bool(settings, "videobg");
 
+		obs_data_set_bool(settings, "videobg", false);
 		obs_data_set_bool(settings, "blurbgbool", false);
 		obs_data_set_bool(settings, "setbg", false);
 		obs_data_set_bool(settings, "setcolor", false);
@@ -133,6 +276,7 @@ static bool tracking_props_modified(obs_properties_t* props, obs_property_t* pro
 		obs_data_set_bool(settings, "blurbgbool", chblur);
 		obs_data_set_bool(settings, "setbg", chbg);
 		obs_data_set_bool(settings, "setcolor", chcolor);
+		obs_data_set_bool(settings, "videobg", chvideo);
 	}
 
 	return true;
@@ -154,6 +298,7 @@ static bool tracking_blur_modified(obs_properties_t* props, obs_property_t* prop
 
 		obs_data_set_bool(settings, "setbg", false);
 		obs_data_set_bool(settings, "setcolor", false);
+		obs_data_set_bool(settings, "videobg", false);
 		
 	}
 	else
@@ -162,6 +307,7 @@ static bool tracking_blur_modified(obs_properties_t* props, obs_property_t* prop
 		//obs_data_set_default_bool(settings, "setbg", true);
 		obs_data_set_bool(settings, "setbg", true);
 		obs_data_set_bool(settings, "setcolor", false);
+		obs_data_set_bool(settings, "videobg", false);
 
 
 	}
@@ -183,6 +329,7 @@ static bool tracking_setbg_modified(obs_properties_t* props, obs_property_t* pro
 		//obs_data_set_default_bool(settings, "blurbgbool", false);
 		obs_data_set_bool(settings, "blurbgbool", false);
 		obs_data_set_bool(settings, "setcolor", false);
+		obs_data_set_bool(settings, "videobg", false);
 
 	}
 	else
@@ -191,6 +338,7 @@ static bool tracking_setbg_modified(obs_properties_t* props, obs_property_t* pro
 		//obs_data_set_default_bool(settings, "blurbgbool", true);
 		obs_data_set_bool(settings, "blurbgbool",true);
 		obs_data_set_bool(settings, "setcolor", false);
+		obs_data_set_bool(settings, "videobg", false);
 
 	}
 	setbginit = false;
@@ -214,6 +362,7 @@ static bool tracking_secolor_modified(obs_properties_t* props, obs_property_t* p
 			obs_data_set_bool(settings, "seg_disen", false);
 		obs_data_set_bool(settings, "blurbgbool", false);
 		obs_data_set_bool(settings, "setbg", false);
+		obs_data_set_bool(settings, "videobg", false);
 
 	}
 	else
@@ -222,6 +371,7 @@ static bool tracking_secolor_modified(obs_properties_t* props, obs_property_t* p
 		//obs_data_set_default_bool(settings, "blurbgbool", true);
 		obs_data_set_bool(settings, "blurbgbool", true);
 		obs_data_set_bool(settings, "setbg", false);
+		obs_data_set_bool(settings, "videobg", false);
 
 	}
 	setbginit = false;
@@ -230,6 +380,25 @@ static bool tracking_secolor_modified(obs_properties_t* props, obs_property_t* p
 }
 
 
+
+static bool tracking_videobg_modified(obs_properties_t* props, obs_property_t* property, obs_data_t* settings)
+{
+	if (obs_data_get_bool(settings, "videobg")) {
+		if (obs_data_get_bool(settings, "seg_disen"))
+			obs_data_set_bool(settings, "seg_disen", false);
+		obs_data_set_bool(settings, "blurbgbool", false);
+		obs_data_set_bool(settings, "setbg", false);
+		obs_data_set_bool(settings, "setcolor", false);
+	}
+	else {
+		obs_data_set_bool(settings, "blurbgbool", true);
+		obs_data_set_bool(settings, "setbg", false);
+		obs_data_set_bool(settings, "setcolor", false);
+	}
+	setbginit = false;
+
+	return true;
+}
 
 static bool ActivateClicked(obs_properties_t* props, obs_property_t* p,void* data)
 {
@@ -292,6 +461,15 @@ static obs_properties_t *filter_properties(void *data)
 		OBS_PATH_FILE, image_filter, obs_get_module_data_path(obs_current_module()) );
 	//obs_property_set_modified_callback(bgpic, tracking_props_modified);
 
+	static const char* video_filter =
+		"Video Files (*.mp4 *.mov *.m4v *.mkv *.webm *.avi *.wmv *.flv);;"
+		"All Files (*.*)";
+
+	obs_property_t* videobg = obs_properties_add_bool(props, "videobg", obs_module_text("videobg"));
+	obs_property_set_modified_callback(videobg, tracking_videobg_modified);
+	obs_properties_add_path(props, "bgvideo", nullptr, OBS_PATH_FILE, video_filter,
+		obs_get_module_data_path(obs_current_module()));
+
 	obs_property_t* setcolor = obs_properties_add_bool(props, "setcolor", obs_module_text("setcolor"));
 	obs_property_set_modified_callback(setcolor, tracking_secolor_modified);
 
@@ -314,6 +492,8 @@ static void filter_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "blurbgbool", true);
 	obs_data_set_default_bool(settings, "setbg", false);
 	obs_data_set_default_string(settings, "bgpic", obs_module_file("bkg.jpg"));
+	obs_data_set_default_bool(settings, "videobg", false);
+	obs_data_set_default_string(settings, "bgvideo", "");
 	obs_data_set_default_bool(settings, "setcolor", false);
 	obs_data_set_default_int(settings, "bgColor", 0x000000);
 }
@@ -329,6 +509,8 @@ static void filter_update(void *data, obs_data_t *settings)
 	wsf->blurbg = obs_data_get_bool(settings, "blurbgbool");
 	wsf->usesetbg = obs_data_get_bool(settings, "setbg");
 	wsf->bgpath = (char*)obs_data_get_string(settings, "bgpic");
+	wsf->usevideobg = obs_data_get_bool(settings, "videobg");
+	wsf->videopath = (char*)obs_data_get_string(settings, "bgvideo");
 	wsf->usesetcolor = obs_data_get_bool(settings, "setcolor");
 	uint64_t color = obs_data_get_int(settings, "bgColor");
 	wsf->backgroundColor.val[0] = (double)((color >> 16) & 0x0000ff);
@@ -449,8 +631,13 @@ void blurbg(cv::Mat& bg, cv::Mat& blurbg){
 static struct obs_source_frame *filter_render(void *data,struct obs_source_frame *frame)
 {
 	struct wx_seg_filter* wsf =reinterpret_cast<wx_seg_filter*>(data);
-	if (wsf->disseg == true)
+	if (wsf->disseg == true) {
+		if (videoBg.active()) {
+			videoBg.stop();
+			bgIsVideo = false;
+		}
 		return frame;
+	}
 
 	// Convert to BGR
 	if (!handle)
@@ -544,7 +731,11 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 			//FILE* pFile = _wfopen(path_ws.c_str(), L"rb");
 			//setlocale(LC_ALL, "Chinese-simplified");//设置中文环境
 			setbgpic.release();
-			FILE* pFile = (wsf->bgpath && *wsf->bgpath) ? os_fopen(wsf->bgpath, "rb") : nullptr;
+			videoBg.stop();
+			bgIsVideo = wsf->usevideobg && !wsf->blurbg && wsf->videopath && *wsf->videopath;
+			if (bgIsVideo)
+				videoBg.start(wsf->videopath, imageBGR.cols, imageBGR.rows);
+			FILE* pFile = (!bgIsVideo && wsf->usesetbg && wsf->bgpath && *wsf->bgpath) ? os_fopen(wsf->bgpath, "rb") : nullptr;
 			if (pFile) {
 				fseek(pFile, 0, SEEK_END);
 				long lSize = ftell(pFile);
@@ -579,13 +770,18 @@ static struct obs_source_frame *filter_render(void *data,struct obs_source_frame
 
 
 
+		// Video background: pull the newest decoded frame (keeps the previous
+		// one / placeholder until the first frame is ready).
+		if (bgIsVideo && !wsf->blurbg)
+			videoBg.getFrame(setbgpic);
+
 		wx_image_t img_blend;
 		// img_blend作为输出参数，只需要分配并设置data变量即可
 		img_blend.data = blend.data;
 		wx_image_t img_bg;
 		if(wsf->blurbg)
 			img_bg = { bg.cols,bg.rows, WX_IMG_BGR24,(int)bg.step[0],bg.data };
-		else if(wsf->usesetbg)
+		else if(wsf->usesetbg || bgIsVideo)
 			img_bg = { setbgpic.cols,setbgpic.rows, WX_IMG_BGR24,(int)setbgpic.step[0],setbgpic.data };
 		else
 			img_bg = { setbgcolor.cols,setbgcolor.rows, WX_IMG_BGR24,(int)setbgcolor.step[0],setbgcolor.data };
@@ -609,6 +805,8 @@ static void filter_destroy(void *data)
 {
 	struct wx_seg_filter* wsf =	reinterpret_cast<wx_seg_filter*>(data);
 
+	videoBg.stop();
+	bgIsVideo = false;
 	if (wsf) {
 		destroyScalers(wsf);
 		bfree(wsf);
