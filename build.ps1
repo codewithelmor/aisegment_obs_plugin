@@ -7,6 +7,8 @@
       obs-plugins/64bit/wx_seg_obs.dll        <- compiled plugin (you must supply it, or use -Build)
       obs-plugins/64bit/wx_video_seg.dll      <- vendor runtime from 3rd/lh320_windows_1.2.2/bin/x64
       data/obs-plugins/wx_seg_obs/bkg.jpg, obs.lic, locale/*.ini
+      README.md                               <- install instructions (from package\README.md)
+      install.ps1                             <- auto-installer (detects OBS dir, copies data + obs-plugins)
 
 .PARAMETER PluginDll
     Path to the compiled wx_seg_obs.dll. If omitted, common build output folders are searched.
@@ -80,6 +82,8 @@ $files = [ordered]@{
     'data/obs-plugins/wx_seg_obs/obs.lic'             = Join-Path $root 'data\obs.lic'
     'data/obs-plugins/wx_seg_obs/locale/en-US.ini'    = Join-Path $root 'data\locale\en-US.ini'
     'data/obs-plugins/wx_seg_obs/locale/zh-CN.ini'    = Join-Path $root 'data\locale\zh-CN.ini'
+    'install.ps1'                                     = Join-Path $root 'install.ps1'
+    'README.md'                                       = Join-Path $root 'package\README.md'
 }
 foreach ($entry in $files.Keys) {
     if (-not (Test-Path $files[$entry])) { throw "Missing file for '$entry': $($files[$entry])" }
@@ -107,4 +111,4 @@ finally {
 
 $size = '{0:N1} MB' -f ((Get-Item $Output).Length / 1MB)
 Write-Host "Created $Output ($size)"
-Write-Host "Install: Expand-Archive '$Output' -DestinationPath 'C:\Program Files\obs-studio' -Force"
+Write-Host "Install: extract the zip, then run .\install.ps1 (or Expand-Archive into the OBS folder)"
